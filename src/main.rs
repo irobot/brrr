@@ -249,10 +249,14 @@ fn update_stats(stats: &mut HashMap<StrVec, Stat, FastHasherBuilder>, station: &
         Some(stats) => stats,
         None => stats.entry(StrVec::new(station)).or_default(),
     };
-    stats.min = stats.min.min(t);
+    if t < stats.min {
+        stats.min = t;
+    }
+    if t > stats.max {
+        stats.max = t;
+    }
     stats.sum += i64::from(t);
     stats.count += 1;
-    stats.max = stats.max.max(t);
 }
 
 #[inline]
