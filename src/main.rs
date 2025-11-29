@@ -3,6 +3,7 @@
 #![feature(hasher_prefixfree_extras)]
 #![feature(ptr_cast_array)]
 
+use std::io::Write;
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap, btree_map::Entry},
@@ -175,7 +176,16 @@ fn main() {
             }
         }
     });
-    print!("{{");
+
+    print(stats);
+}
+
+#[inline(never)]
+fn print(stats: BTreeMap<String, (i16, i64, usize, i16)>) {
+    let stdout = std::io::stdout();
+    let stdout = stdout.lock();
+    let mut writer = std::io::BufWriter::new(stdout);
+    write!(writer, "{{").unwrap();
     let stats = BTreeMap::from_iter(
         stats
             .iter()
@@ -184,17 +194,19 @@ fn main() {
     );
     let mut stats = stats.into_iter().peekable();
     while let Some((station, (min, sum, count, max))) = stats.next() {
-        print!(
+        write!(
+            writer,
             "{station}={:.1}/{:.1}/{:.1}",
             (min as f64) / 10.,
             (sum as f64) / 10. / (count as f64),
             (max as f64) / 10.
-        );
+        )
+        .unwrap();
         if stats.peek().is_some() {
-            print!(", ");
+            write!(writer, ", ").unwrap();
         }
     }
-    print!("}}");
+    write!(writer, "}}").unwrap();
 }
 
 fn one(map: &[u8]) -> HashMap<StrVec, (i16, i64, usize, i16), FastHasherBuilder> {
