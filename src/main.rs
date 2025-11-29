@@ -13,6 +13,7 @@ use std::{
 };
 
 const SEMI: u8x64 = u8x64::splat(b';');
+const NEWL: u8x64 = u8x64::splat(b'\n');
 
 struct FastHasherBuilder;
 struct FastHasher(u64);
@@ -135,11 +136,10 @@ fn main() {
         FastHasherBuilder,
     );
     let mut at = 0;
-    loop {
-        let line = next_line(map, &mut at);
-        if line.is_empty() {
-            break;
-        }
+    while at < map.len() {
+        let newline_at = at + next_newline(map, at);
+        let line = &map[at..newline_at];
+        at = newline_at + 1;
         let (station, temperature) = split_semi(line);
         let t = parse_temperature(temperature);
         let stats = match stats.get_mut(station) {
@@ -176,20 +176,28 @@ fn main() {
 }
 
 #[inline]
-fn next_line<'a>(map: &'a [u8], at: &mut usize) -> &'a [u8] {
-    let rest = &map[*at..];
-    // SAFETY: rest is valid for at least rest.len() bytes
-    let next_newline =
-        unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
-    if next_newline.is_null() {
-        // don't need to remember to break, since next iteration will find empty line
-        *at += rest.len();
-        rest
+fn next_newline(map: &[u8], at: usize) -> usize {
+    let rest = &map[at..];
+    let newline_eq = NEWL.simd_eq(u8x64::load_or_default(rest));
+    if let Some(i) = newline_eq.first_set() {
+        i
     } else {
-        // SAFETY: memchr always returns pointers in rest, which are valid
-        let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
-        *at += len + 1;
-        &rest[..len]
+        // we know, line is at most 100+1+5 = 106b,
+        // but we can only search 64b, so the search _may_ have to fall back to memchr
+        // we know there _must_ be a newline, so rest[64..] must be non-empty
+        let restrest = &rest[64..];
+        // SAFETY: restrest is valid for at least restrest.len() bytes
+        let next_newline = unsafe {
+            libc::memchr(
+                restrest.as_ptr() as *const c_void,
+                b'\n' as c_int,
+                restrest.len(),
+            )
+        };
+        assert!(!next_newline.is_null());
+        // SAFETY: memchr always returns pointers in restrest, which are valid
+        let len = unsafe { (next_newline as *const u8).offset_from(restrest.as_ptr()) } as usize;
+        64 + len
     }
 }
 
