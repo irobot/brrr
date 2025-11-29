@@ -5,17 +5,48 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::{c_int, c_void},
     fs::File,
+    hash::{BuildHasher, Hasher},
     os::fd::AsRawFd,
     simd::{cmp::SimdPartialEq, u8x64},
 };
 
 const SEMI: u8x64 = u8x64::splat(b';');
 
+struct FastHasherBuilder;
+struct FastHasher(u64);
+
+impl BuildHasher for FastHasherBuilder {
+    type Hasher = FastHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FastHasher(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        let mut last = [1u8; 8];
+        (last[..remainder.len()]).copy_from_slice(remainder);
+        for &chunk in chunks.iter().chain(std::iter::once(&last)) {
+            let mixed = self.0 as u128 * (u64::from_ne_bytes(chunk) as u128);
+            self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+        }
+    }
+}
+
 fn main() {
     let f = File::open("measurements.txt").unwrap();
     let map = mmap(&f);
     // TODO: maybe make the key &[u8], but measure since we're breaking MADV_SEQUENTIAL
-    let mut stats = HashMap::<Vec<u8>, (i16, i64, usize, i16)>::with_capacity(10_000);
+    let mut stats = HashMap::<Vec<u8>, (i16, i64, usize, i16), _>::with_capacity_and_hasher(
+        100_000,
+        FastHasherBuilder,
+    );
     let mut at = 0;
     loop {
         let line = next_line(map, &mut at);
