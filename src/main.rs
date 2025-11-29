@@ -132,6 +132,25 @@ impl Borrow<[u8]> for StrVec {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Stat {
+    min: i16,
+    max: i16,
+    sum: i64,
+    count: usize,
+}
+
+impl Default for Stat {
+    fn default() -> Self {
+        Self {
+            min: i16::MAX,
+            sum: 0,
+            count: 0,
+            max: i16::MIN,
+        }
+    }
+}
+
 fn main() {
     let f = File::open("measurements.txt").unwrap();
     let mut stats = BTreeMap::new();
@@ -166,10 +185,10 @@ fn main() {
                     }
                     Entry::Occupied(some) => {
                         let stat = some.into_mut();
-                        stat.0 = stat.0.min(v.0);
-                        stat.1 += v.1;
-                        stat.2 += v.2;
-                        stat.3 = stat.3.max(v.3);
+                        stat.min = stat.min.min(v.min);
+                        stat.sum += v.sum;
+                        stat.count += v.count;
+                        stat.max = stat.max.max(v.max);
                     }
                 }
             }
@@ -180,7 +199,7 @@ fn main() {
 }
 
 #[inline(never)]
-fn print(stats: BTreeMap<String, (i16, i64, usize, i16)>) {
+fn print(stats: BTreeMap<String, Stat>) {
     let stdout = std::io::stdout();
     let stdout = stdout.lock();
     let mut writer = std::io::BufWriter::new(stdout);
@@ -192,13 +211,13 @@ fn print(stats: BTreeMap<String, (i16, i64, usize, i16)>) {
             .map(|(k, v)| (unsafe { std::str::from_utf8_unchecked(k.as_ref()) }, *v)),
     );
     let mut stats = stats.into_iter().peekable();
-    while let Some((station, (min, sum, count, max))) = stats.next() {
+    while let Some((station, stat)) = stats.next() {
         write!(
             writer,
             "{station}={:.1}/{:.1}/{:.1}",
-            (min as f64) / 10.,
-            (sum as f64) / 10. / (count as f64),
-            (max as f64) / 10.
+            (stat.min as f64) / 10.,
+            (stat.sum as f64) / 10. / (stat.count as f64),
+            (stat.max as f64) / 10.
         )
         .unwrap();
         if stats.peek().is_some() {
@@ -209,7 +228,7 @@ fn print(stats: BTreeMap<String, (i16, i64, usize, i16)>) {
 }
 
 #[inline(never)]
-fn one(map: &[u8]) -> HashMap<StrVec, (i16, i64, usize, i16), FastHasherBuilder> {
+fn one(map: &[u8]) -> HashMap<StrVec, Stat, FastHasherBuilder> {
     let mut stats = HashMap::with_capacity_and_hasher(1_024, FastHasherBuilder);
     let mut at = 0;
     while at < map.len() {
@@ -225,21 +244,15 @@ fn one(map: &[u8]) -> HashMap<StrVec, (i16, i64, usize, i16), FastHasherBuilder>
     stats
 }
 
-fn update_stats(
-    stats: &mut HashMap<StrVec, (i16, i64, usize, i16), FastHasherBuilder>,
-    station: &[u8],
-    t: i16,
-) {
+fn update_stats(stats: &mut HashMap<StrVec, Stat, FastHasherBuilder>, station: &[u8], t: i16) {
     let stats = match stats.get_mut(station) {
         Some(stats) => stats,
-        None => stats
-            .entry(StrVec::new(station))
-            .or_insert((i16::MAX, 0, 0, i16::MIN)),
+        None => stats.entry(StrVec::new(station)).or_default(),
     };
-    stats.0 = stats.0.min(t);
-    stats.1 += i64::from(t);
-    stats.2 += 1;
-    stats.3 = stats.3.max(t);
+    stats.min = stats.min.min(t);
+    stats.sum += i64::from(t);
+    stats.count += 1;
+    stats.max = stats.max.max(t);
 }
 
 #[inline]
