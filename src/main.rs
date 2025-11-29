@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::{c_int, c_void},
     fs::File,
     os::fd::AsRawFd,
 };
@@ -9,7 +10,21 @@ fn main() {
     let map = mmap(&f);
     // TODO: maybe make the key &[u8], but measure since we're breaking MADV_SEQUENTIAL
     let mut stats = HashMap::<Vec<u8>, (i16, i64, usize, i16)>::new();
-    for line in map.split(|c| *c == b'\n') {
+    let mut at = 0;
+    loop {
+        let rest = &map[at..];
+        // SAFETY: rest is valid for at least rest.len() bytes
+        let next_newline =
+            unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
+        let line = if next_newline.is_null() {
+            // don't need to remember to break, since next iteration will find empty line
+            rest
+        } else {
+            // SAFETY: memchr always returns pointers in rest, which are valid
+            let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
+            &rest[..len]
+        };
+        at += line.len() + 1;
         if line.is_empty() {
             break;
         }
