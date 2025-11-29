@@ -1,5 +1,6 @@
 #![feature(portable_simd)]
 #![feature(slice_split_once)]
+#![feature(hasher_prefixfree_extras)]
 
 use std::{
     borrow::Borrow,
@@ -26,17 +27,28 @@ impl BuildHasher for FastHasherBuilder {
 
 impl Hasher for FastHasher {
     fn finish(&self) -> u64 {
-        self.0
+        self.0 ^ self.0.rotate_right(33) ^ self.0.rotate_right(15)
     }
 
+    fn write_length_prefix(&mut self, _len: usize) {}
+
     fn write(&mut self, bytes: &[u8]) {
-        let (chunks, remainder) = bytes.as_chunks::<8>();
-        let mut last = [1u8; 8];
-        (last[..remainder.len()]).copy_from_slice(remainder);
-        for &chunk in chunks.iter().chain(std::iter::once(&last)) {
-            let mixed = self.0 as u128 * (u64::from_ne_bytes(chunk) as u128);
-            self.0 = (mixed >> 64) as u64 ^ mixed as u64;
-        }
+        let mut word = [0u64; 2];
+        unsafe {
+            std::ptr::copy(
+                bytes.as_ptr(),
+                word.as_mut_ptr().cast::<u8>(),
+                bytes.len().min(16),
+            )
+        };
+        self.0 = word[0] ^ word[1];
+        // let (chunks, remainder) = bytes.as_chunks::<8>();
+        // let mut last = [1u8; 8];
+        // (last[..remainder.len()]).copy_from_slice(remainder);
+        // for &chunk in chunks.iter().chain(std::iter::once(&last)) {
+        //     let mixed = self.0 as u128 * (u64::from_ne_bytes(chunk) as u128);
+        //     self.0 = (mixed >> 64) as u64 ^ mixed as u64;
+        // }
     }
 }
 
@@ -118,9 +130,8 @@ impl Borrow<[u8]> for StrVec {
 fn main() {
     let f = File::open("measurements.txt").unwrap();
     let map = mmap(&f);
-    // TODO: maybe make the key &[u8], but measure since we're breaking MADV_SEQUENTIAL
     let mut stats = HashMap::<StrVec, (i16, i64, usize, i16), _>::with_capacity_and_hasher(
-        100_000,
+        1_000,
         FastHasherBuilder,
     );
     let mut at = 0;
