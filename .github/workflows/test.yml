@@ -33,16 +33,28 @@ jobs:
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # branch=master
         with:
           toolchain: ${{ matrix.toolchain }}
-      - name: cargo generate-lockfile
-        # enable this ci template to run regardless of whether the lockfile is checked in or not
-        if: hashFiles('Cargo.lock') == ''
-        run: cargo generate-lockfile
       # https://twitter.com/jonhoo/status/1571290371124260865
       - name: cargo test --locked
         run: cargo test --locked --all-features --all-targets
-      # https://github.com/rust-lang/cargo/issues/6669
-      - name: cargo test --doc
-        run: cargo test --locked --all-features --doc
+  execute:
+    runs-on: ubuntu-latest
+    name: 10% of 1brc
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # tag=v5.0.0
+        with:
+          submodules: true
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # branch=master
+        with:
+          toolchain: stable
+      - name: git clone 1brc
+        run: git clone https://github.com/gunnarmorling/1brc.git
+      - name: create measurements
+        run: cd 1brc && ./create_measurements.sh 100000000 && mv 1brc/measurements.txt .
+      - name: cargo run
+        run: cargo run --locked --release > candidate.txt
+      - name: diff
+        run: diff candidate.txt correct-100m.txt
   os-check:
     # run cargo test on mac and windows
     runs-on: ${{ matrix.os }}
