@@ -11,11 +11,18 @@ use std::{
     ffi::{c_int, c_void},
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
-    os::fd::AsRawFd,
-    simd::{cmp::SimdPartialEq, u8x64},
+    mem::ManuallyDrop,
+    simd::{cmp::SimdPartialEq, Simd},
 };
 
-const NEWL: u8x64 = u8x64::splat(b'\n');
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+const HASH_K: u64 = 0xf1357aea2e62a9c5;
+const HASH_SEED: u64 = 0x13198a2e03707344;
 
 struct FastHasherBuilder;
 struct FastHasher(u64);
@@ -24,38 +31,62 @@ impl BuildHasher for FastHasherBuilder {
     type Hasher = FastHasher;
 
     fn build_hasher(&self) -> Self::Hasher {
-        FastHasher(0xcbf29ce484222325)
+        FastHasher(0)
     }
 }
 
 impl Hasher for FastHasher {
     fn finish(&self) -> u64 {
-        self.0 ^ self.0.rotate_right(33) ^ self.0.rotate_right(15)
+        self.0.rotate_left(26)
     }
 
     fn write_length_prefix(&mut self, _len: usize) {}
 
     fn write(&mut self, bytes: &[u8]) {
-        let mut word = [0u64; 2];
-        unsafe {
-            std::ptr::copy(
-                bytes.as_ptr(),
-                word.as_mut_ptr().cast::<u8>(),
-                bytes.len().min(16),
-            )
-        };
-        self.0 = word[0] ^ word[1];
+        let len = bytes.len();
+        let mut acc = HASH_SEED;
+
+        match len {
+            0..4 => {
+                let lo = bytes[0];
+                let mid = bytes[len / 2];
+                let hi = bytes[len - 1];
+                acc ^= (lo as u64) | ((mid as u64) << 8) | ((hi as u64) << 16);
+            }
+            4.. => {
+                acc ^= u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as u64;
+            }
+        }
+
+        self.0 = self.0.wrapping_add(acc).wrapping_mul(HASH_K);
     }
 }
 
-const INLINE: usize = 16;
+const INLINE: usize = std::mem::size_of::<AllocedStrVec>();
 const LAST: usize = INLINE - 1;
 
+#[repr(C)]
 union StrVec {
     inlined: [u8; INLINE],
+    heap: ManuallyDrop<AllocedStrVec>,
+}
+
+#[repr(C)]
+struct AllocedStrVec {
     // if length high bit is set, then inlined into pointer then len
     // otherwise, pointer is a pointer to Vec<u8>
-    heap: (usize, *mut u8),
+    ptr: *mut u8,
+    // len must be last for alignment with `inlined[LAST]` in the `StrVec` union
+    len: usize,
+}
+
+impl Drop for AllocedStrVec {
+    fn drop(&mut self) {
+        let len = usize::from_le(self.len);
+        let ptr = self.ptr;
+        let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        let _ = unsafe { Box::from_raw(slice_ptr) };
+    }
 }
 
 // SAFETY: effectively just a Vec<str>, which is fine across thread boundaries
@@ -71,7 +102,10 @@ impl StrVec {
         } else {
             let ptr = Box::into_raw(s.to_vec().into_boxed_slice());
             Self {
-                heap: (ptr.len().to_be(), ptr as *mut u8),
+                heap: ManuallyDrop::new(AllocedStrVec {
+                    len: ptr.len().to_le(),
+                    ptr: ptr.cast(),
+                }),
             }
         }
     }
@@ -79,12 +113,9 @@ impl StrVec {
 
 impl Drop for StrVec {
     fn drop(&mut self) {
-        if unsafe { self.inlined[LAST] } == 0x00 {
-            unsafe {
-                let len = usize::from_be(self.heap.0);
-                let ptr = self.heap.1;
-                let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
-                let _ = Box::from_raw(slice_ptr);
+        unsafe {
+            if self.inlined[LAST] == 0x00 {
+                ManuallyDrop::drop(&mut self.heap)
             }
         }
     }
@@ -98,8 +129,8 @@ impl AsRef<[u8]> for StrVec {
                 std::slice::from_raw_parts(self.inlined.as_ptr(), len)
             } else {
                 std::hint::cold_path();
-                let len = usize::from_be(self.heap.0);
-                let ptr = self.heap.1;
+                let len = usize::from_le(self.heap.len);
+                let ptr = self.heap.ptr;
                 std::slice::from_raw_parts(ptr, len)
             }
         }
@@ -165,7 +196,7 @@ fn main() {
             let end = if end == map.len() {
                 map.len()
             } else {
-                let newline_at = next_newline(&map[end..], 0);
+                let newline_at = find_newline(&map[end..]).unwrap();
                 end + newline_at + 1
             };
             let map = &map[start..end];
@@ -231,7 +262,7 @@ fn one(map: &[u8]) -> HashMap<StrVec, Stat, FastHasherBuilder> {
     let mut stats = HashMap::with_capacity_and_hasher(1_024, FastHasherBuilder);
     let mut at = 0;
     while at < map.len() {
-        let newline_at = at + next_newline(map, at);
+        let newline_at = at + unsafe { find_newline(&map[at..]).unwrap_unchecked() };
         let line = unsafe { map.get_unchecked(at..newline_at) };
         at = newline_at + 1;
         // parse temperature backwards, avoiding search for semicolon
@@ -287,39 +318,63 @@ fn update_stats(stats: &mut HashMap<StrVec, Stat, FastHasherBuilder>, station: &
     stats.count += 1;
 }
 
-#[inline]
-fn next_newline(map: &[u8], at: usize) -> usize {
-    let rest = unsafe { map.get_unchecked(at..) };
-    let against = if let Some(restu8x64) = rest.first_chunk::<64>() {
-        u8x64::from_array(*restu8x64)
-    } else {
-        std::hint::cold_path();
-        u8x64::load_or_default(rest)
-    };
-    let newline_eq = NEWL.simd_eq(against);
-    if let Some(i) = newline_eq.first_set() {
-        i
-    } else {
-        // we know, line is at most 100+1+5 = 106b,
-        // but we can only search 64b, so the search _may_ have to fall back to memchr
-        // we know there _must_ be a newline, so rest[64..] must be non-empty
-        std::hint::cold_path();
-        let restrest = unsafe { rest.get_unchecked(64..) };
-        // SAFETY: restrest is valid for at least restrest.len() bytes
-        let next_newline = unsafe {
-            libc::memchr(
-                restrest.as_ptr() as *const c_void,
-                b'\n' as c_int,
-                restrest.len(),
-            )
-        };
-        assert!(!next_newline.is_null());
-        // SAFETY: memchr always returns pointers in restrest, which are valid
-        let len = unsafe { (next_newline as *const u8).offset_from(restrest.as_ptr()) } as usize;
-        64 + len
+// SAFETY: buffer must contain a semicolon in the last min(8, buffer.len()) bytes
+unsafe fn split_at_semicolon(buffer: &[u8]) -> (&[u8], &[u8]) {
+    let mut pos = buffer.len() - 4;
+    unsafe {
+        // SAFETY: readme promises there will be a semicolon
+        while *buffer.get_unchecked(pos) != b';' {
+            pos -= 1;
+        }
+        let (before, after) = buffer.split_at_unchecked(pos + 1);
+        (&before[..before.len() - 1], after)
     }
 }
 
+pub fn find_newline(mut buffer: &[u8]) -> Option<usize> {
+    const LANES: usize = 32;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b'\n');
+
+    let mut i = 0;
+    while let Some((chunk, rest)) = buffer.split_first_chunk() {
+        let bytes = Simd::<u8, LANES>::from_array(*chunk);
+        let index = bytes.simd_eq(SPLAT).first_set().map(|set| set + i);
+        if index.is_some() {
+            return index;
+        }
+        i += LANES;
+        buffer = rest;
+    }
+
+    let bytes = Simd::<u8, LANES>::load_or_default(buffer);
+    bytes.simd_eq(SPLAT).first_set().map(|set| set + i)
+}
+
+#[inline]
+fn parse_temperature(t: &[u8]) -> i16 {
+    let tlen = t.len();
+    unsafe { std::hint::assert_unchecked(tlen >= 3) };
+    let is_neg = std::hint::select_unpredictable(t[0] == b'-', true, false);
+    let sign = i16::from(!is_neg) * 2 - 1;
+    let skip = usize::from(is_neg);
+    let has_dd = std::hint::select_unpredictable(tlen - skip == 4, true, false);
+    let mul = i16::from(has_dd) * 90 + 10;
+    let t1 = mul * i16::from(t[skip] - b'0');
+    let t2 = i16::from(has_dd) * 10 * i16::from(t[tlen - 3] - b'0');
+    let t3 = i16::from(t[tlen - 1] - b'0');
+    sign * (t1 + t2 + t3)
+}
+
+#[test]
+fn pt() {
+    assert_eq!(parse_temperature(b"0.0"), 0);
+    assert_eq!(parse_temperature(b"9.2"), 92);
+    assert_eq!(parse_temperature(b"-9.2"), -92);
+    assert_eq!(parse_temperature(b"98.2"), 982);
+    assert_eq!(parse_temperature(b"-98.2"), -982);
+}
+
+#[cfg(unix)]
 fn mmap(f: &File) -> &'_ [u8] {
     let len = f.metadata().unwrap().len();
     unsafe {
@@ -327,7 +382,7 @@ fn mmap(f: &File) -> &'_ [u8] {
             std::ptr::null_mut(),
             len as libc::size_t,
             libc::PROT_READ,
-            libc::MAP_SHARED,
+            libc::MAP_PRIVATE,
             f.as_raw_fd(),
             0,
         );
@@ -340,5 +395,39 @@ fn mmap(f: &File) -> &'_ [u8] {
             }
             std::slice::from_raw_parts(ptr as *const u8, len as usize)
         }
+    }
+}
+
+#[cfg(windows)]
+fn mmap(f: &File) -> &'_ [u8] {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+    };
+
+    let len = f.metadata().unwrap().len();
+    unsafe {
+        let hfile = f.as_raw_handle();
+
+        let hmap = CreateFileMappingW(
+            hfile,
+            std::ptr::null_mut(),
+            PAGE_READONLY,
+            0,
+            0,
+            std::ptr::null(),
+        );
+
+        if hmap == std::ptr::null_mut() {
+            panic!("{:?}", std::io::Error::last_os_error());
+        }
+
+        let view = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, 0);
+        if view.Value.is_null() {
+            CloseHandle(hmap);
+            panic!("{:?}", std::io::Error::last_os_error());
+        }
+
+        std::slice::from_raw_parts(view.Value as *const u8, len as usize)
     }
 }
