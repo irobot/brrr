@@ -8,5 +8,8 @@ lto = "fat"
 panic = "abort"
 debug = true
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.177"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Memory", "Win32_Foundation", "Win32_Security"] }

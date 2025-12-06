@@ -11,9 +11,14 @@ use std::{
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
     mem::ManuallyDrop,
-    os::fd::AsRawFd,
     simd::{Simd, cmp::SimdPartialEq},
 };
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 const HASH_K: u64 = 0xf1357aea2e62a9c5;
 const HASH_SEED: u64 = 0x13198a2e03707344;
@@ -337,6 +342,7 @@ fn pt() {
     assert_eq!(parse_temperature(b"-98.2"), -982);
 }
 
+#[cfg(unix)]
 fn mmap(f: &File) -> &'_ [u8] {
     let len = f.metadata().unwrap().len();
     unsafe {
@@ -357,5 +363,39 @@ fn mmap(f: &File) -> &'_ [u8] {
             }
             std::slice::from_raw_parts(ptr as *const u8, len as usize)
         }
+    }
+}
+
+#[cfg(windows)]
+fn mmap(f: &File) -> &'_ [u8] {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY,
+    };
+
+    let len = f.metadata().unwrap().len();
+    unsafe {
+        let hfile = f.as_raw_handle();
+
+        let hmap = CreateFileMappingW(
+            hfile,
+            std::ptr::null_mut(),
+            PAGE_READONLY,
+            0,
+            0,
+            std::ptr::null(),
+        );
+
+        if hmap == std::ptr::null_mut() {
+            panic!("{:?}", std::io::Error::last_os_error());
+        }
+
+        let view = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, 0);
+        if view.Value.is_null() {
+            CloseHandle(hmap);
+            panic!("{:?}", std::io::Error::last_os_error());
+        }
+
+        std::slice::from_raw_parts(view.Value as *const u8, len as usize)
     }
 }
