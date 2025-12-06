@@ -50,7 +50,7 @@ jobs:
       - name: git clone 1brc
         run: git clone https://github.com/gunnarmorling/1brc.git
       - name: create measurements
-        run: cd 1brc && ./create_measurements.sh 100000000 && mv 1brc/measurements.txt .
+        run: cd 1brc && ./mvnw clean verify && ./create_measurements.sh 100000000 && mv 1brc/measurements.txt .
       - name: cargo run
         run: cargo run --locked --release > candidate.txt
       - name: diff
