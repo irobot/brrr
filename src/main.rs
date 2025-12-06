@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::{
     borrow::Borrow,
-    collections::{BTreeMap, HashMap, btree_map::Entry},
+    collections::{btree_map::Entry, BTreeMap, HashMap},
     ffi::{c_int, c_void},
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
@@ -15,7 +15,6 @@ use std::{
     simd::{cmp::SimdPartialEq, u8x64},
 };
 
-const SEMI: u8x64 = u8x64::splat(b';');
 const NEWL: u8x64 = u8x64::splat(b'\n');
 
 struct FastHasherBuilder;
@@ -235,11 +234,40 @@ fn one(map: &[u8]) -> HashMap<StrVec, Stat, FastHasherBuilder> {
         let newline_at = at + next_newline(map, at);
         let line = unsafe { map.get_unchecked(at..newline_at) };
         at = newline_at + 1;
-        let semi = semi_at(line);
-        let station = unsafe { line.get_unchecked(..semi) };
-        let temperature = unsafe { line.get_unchecked(semi + 1..) };
-        let t = parse_temperature(temperature);
-        update_stats(&mut stats, station, t);
+        // parse temperature backwards, avoiding search for semicolon
+        let mut index = line.len() - 1;
+        // The first digit after the decimal point (10^-1)
+        let mut temperature = unsafe { *line.get_unchecked(index) - b'0' } as i16;
+        // skip over the dot (.)
+        index -= 2;
+
+        // The digit before the dot (10^0)
+        temperature += (unsafe { *line.get_unchecked(index) - b'0' } as i16) * 10;
+
+        index -= 1;
+        match *unsafe { line.get_unchecked(index) } {
+            // No minus sign and the number is < 10
+            b';' => (),
+            // Minus sign but the number is > -10
+            b'-' => {
+                temperature = -temperature;
+                index -= 1;
+            }
+            // The number is > 10 (so far)
+            digit => {
+                temperature += ((digit - b'0') as i16) * 100;
+                index -= 1;
+            }
+        }
+        // This character can only be either ';' or '-'
+        if unsafe { *line.get_unchecked(index) } == b'-' {
+            // The number is negative and <= -10
+            temperature = -temperature;
+            index -= 1;
+        }
+        // `index` now points at the semicolon
+        let station = unsafe { line.get_unchecked(..index) };
+        update_stats(&mut stats, station, temperature);
     }
     stats
 }
@@ -290,43 +318,6 @@ fn next_newline(map: &[u8], at: usize) -> usize {
         let len = unsafe { (next_newline as *const u8).offset_from(restrest.as_ptr()) } as usize;
         64 + len
     }
-}
-
-#[inline]
-fn semi_at(line: &[u8]) -> usize {
-    // we know, line is at most 100+1+5 = 106b
-    if line.len() > 64 {
-        std::hint::cold_path();
-        line.iter().position(|c| *c == b';').unwrap()
-    } else {
-        let delim_eq = SEMI.simd_eq(u8x64::load_or_default(line));
-        // SAFETY: we're promised there is a ; in every line
-        unsafe { delim_eq.first_set().unwrap_unchecked() }
-    }
-}
-
-#[inline]
-fn parse_temperature(t: &[u8]) -> i16 {
-    let tlen = t.len();
-    unsafe { std::hint::assert_unchecked(tlen >= 3) };
-    let is_neg = std::hint::select_unpredictable(t[0] == b'-', true, false);
-    let sign = i16::from(!is_neg) * 2 - 1;
-    let skip = usize::from(is_neg);
-    let has_dd = std::hint::select_unpredictable(tlen - skip == 4, true, false);
-    let mul = i16::from(has_dd) * 90 + 10;
-    let t1 = mul * i16::from(t[skip] - b'0');
-    let t2 = i16::from(has_dd) * 10 * i16::from(t[tlen - 3] - b'0');
-    let t3 = i16::from(t[tlen - 1] - b'0');
-    sign * (t1 + t2 + t3)
-}
-
-#[test]
-fn pt() {
-    assert_eq!(parse_temperature(b"0.0"), 0);
-    assert_eq!(parse_temperature(b"9.2"), 92);
-    assert_eq!(parse_temperature(b"-9.2"), -92);
-    assert_eq!(parse_temperature(b"98.2"), 982);
-    assert_eq!(parse_temperature(b"-98.2"), -982);
 }
 
 fn mmap(f: &File) -> &'_ [u8] {
