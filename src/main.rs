@@ -334,7 +334,7 @@ fn mmap(f: &File) -> &'_ [u8] {
             std::ptr::null_mut(),
             len as libc::size_t,
             libc::PROT_READ,
-            libc::MAP_SHARED,
+            libc::MAP_PRIVATE,
             f.as_raw_fd(),
             0,
         );
