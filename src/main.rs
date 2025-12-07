@@ -396,7 +396,7 @@ fn mmap(f: &File) -> &'_ [u8] {
             std::ptr::null(),
         );
 
-        if hmap == std::ptr::null_mut() {
+        if hmap.is_null() {
             panic!("{:?}", std::io::Error::last_os_error());
         }
 
